@@ -1,20 +1,33 @@
+-- 1. Refund Trend
+-- Grain: One row per month x product category.
+--
+-- Split by category because that is the whole finding: hardware refunds climb
+-- from ~6% to ~40% while accessories stay flat at 2-3%. A single blended line
+-- averages the two together and buries the signal.
 CREATE OR REPLACE VIEW v_refund_trend_monthly AS
 SELECT
-      DATE_TRUNC('month', purchase_ts)::date AS purchase_month,
-      COUNT(order_line_id) AS total_orders,
+      DATE_TRUNC('month', f.purchase_ts)::date AS purchase_month,
+      p.category,
+      COUNT(f.order_line_id) AS total_orders,
 
-      COUNT(order_line_id) FILTER (WHERE is_refunded = TRUE) as refunded_orders,
+      COUNT(f.order_line_id) FILTER (WHERE f.is_refunded = TRUE) AS refunded_orders,
 
       -- Not rounded: 2dp flattens every 2019 month (5.4%-7.5% actual) into
       -- 0.05/0.06/0.07. Keep full precision here, format in the BI layer.
-      COUNT(order_line_id) FILTER (WHERE is_refunded = TRUE)::numeric
-          / COUNT(order_line_id)::numeric AS refund_rate
-FROM fact_order_lines
-WHERE in_valid_window = TRUE
-GROUP BY DATE_TRUNC('month', purchase_ts)::date;
+      COUNT(f.order_line_id) FILTER (WHERE f.is_refunded = TRUE)::numeric
+          / COUNT(f.order_line_id)::numeric AS refund_rate,
 
-SELECT * FROM v_refund_trend_monthly ORDER BY purchase_month;
+      SUM(f.usd_price) AS net_sales,
+      SUM(f.usd_price) FILTER (WHERE f.is_refunded = TRUE) AS refunded_sales
+FROM fact_order_lines f
+JOIN dim_product p ON f.product_id = p.product_id
+WHERE f.in_valid_window = TRUE
+GROUP BY 1, 2;
 
+
+-- 2. Refund Rate by Product and Year
+-- Grain: One row per product x year. share_of_year_orders is the control:
+-- it shows mix held steady while refund rates tripled.
 CREATE OR REPLACE VIEW v_refund_by_product_year AS
 SELECT
       EXTRACT(YEAR FROM f.purchase_ts) AS purchase_year,
@@ -38,24 +51,37 @@ GROUP BY
       EXTRACT(YEAR FROM f.purchase_ts),
       p.category,
       p.product_name;
-      
-SELECT * FROM v_refund_by_product_year ORDER BY purchase_year;
+
 
 -- 3. Revenue & KPI Summary
 -- Grain: One row per month. Fuels the headline scorecard and revenue trend charts.
+--
+-- Three different numbers here can all honestly be called "revenue", so they
+-- are named for exactly what they are. Label them the same way on the dashboard:
+--   gross_at_list   - what the catalogue says the goods cost
+--   net_sales       - what customers actually paid, after discount
+--   retained_sales  - what was still ours after refunds  <- the real number
 CREATE OR REPLACE VIEW v_revenue_summary AS
-SELECT 
+SELECT
     DATE_TRUNC('month', f.purchase_ts)::date AS purchase_month,
-    COUNT(f.order_line_id) AS total_orders,
-    SUM(f.usd_price) AS gross_revenue,
-    COALESCE(SUM(f.usd_price) FILTER (WHERE f.is_refunded = TRUE), 0) AS refunded_revenue,
-    SUM(f.usd_price) - COALESCE(SUM(f.usd_price) FILTER (WHERE f.is_refunded = TRUE), 0) AS net_revenue,
-    ROUND(AVG(f.usd_price), 2) AS average_order_value,
-    SUM(p.list_price_usd - f.usd_price) AS total_discount_given
+    COUNT(f.order_line_id) AS total_order_lines,
+    COUNT(DISTINCT f.order_id) AS total_orders,
+
+    SUM(p.list_price_usd) AS gross_at_list,
+    SUM(f.usd_price) AS net_sales,
+    SUM(p.list_price_usd - f.usd_price) AS discount_given,
+
+    COALESCE(SUM(f.usd_price) FILTER (WHERE f.is_refunded = TRUE), 0) AS refunded_sales,
+    SUM(f.usd_price)
+        - COALESCE(SUM(f.usd_price) FILTER (WHERE f.is_refunded = TRUE), 0) AS retained_sales,
+
+    -- per ORDER, not per line. AVG(usd_price) would be the average line value,
+    -- which is a different (smaller) number wearing the same name.
+    SUM(f.usd_price) / COUNT(DISTINCT f.order_id) AS average_order_value
 FROM fact_order_lines f
 JOIN dim_product p ON f.product_id = p.product_id
 WHERE f.in_valid_window = TRUE
-GROUP BY DATE_TRUNC('month', f.purchase_ts)::date;
+GROUP BY 1;
 
 
 -- 4. Discount Effectiveness
@@ -143,16 +169,32 @@ GROUP BY cohort_month;
 
 
 -- 6. Data Quality Differentiator
--- Grain: A single overarching row summarizing the pipeline's catch metrics.
+-- Grain: A single row summarising what a reader should NOT trust.
+--
+-- Deliberately NOT filtered by in_valid_window - this view exists to count the
+-- rows the other five exclude. Every other view filters. This one must not.
 CREATE OR REPLACE VIEW v_data_quality AS
-SELECT 
+SELECT
     COUNT(order_line_id) AS total_rows_processed,
-    COUNT(order_line_id) FILTER (WHERE NOT in_valid_window) AS out_of_window_rows_filtered,
-    COUNT(order_line_id) FILTER (WHERE dates_were_swapped = TRUE) AS time_traveling_packages_fixed,
-    COUNT(order_line_id) FILTER (WHERE is_duplicate_order_id = TRUE) AS duplicate_order_ids_flagged,
-    ROUND(
-        COUNT(order_line_id) FILTER (WHERE marketing_channel = 'unattributed_direct')::numeric 
-        / COUNT(order_line_id)::numeric, 
-        4
-    ) AS unattributed_traffic_pct
+
+    -- export truncates after Feb 2021, so these are partial-2018 orders
+    COUNT(order_line_id) FILTER (WHERE NOT in_valid_window) AS out_of_window_rows_excluded,
+
+    -- purchase/ship dates arrived reversed and were swapped back
+    COUNT(order_line_id) FILTER (WHERE dates_were_swapped) AS swapped_date_rows,
+
+    COUNT(order_line_id) FILTER (WHERE is_duplicate_order_id) AS duplicate_order_id_rows,
+
+    -- Every refunded row carries a corrupt REFUND_TS (median lag 760 days, max
+    -- 2026-03-14 against a last order of 2021-02-28), so the refunded count IS
+    -- the corrupt-timestamp count. Refund TIMING is unusable. The flag is fine.
+    COUNT(order_line_id) FILTER (WHERE is_refunded) AS corrupt_refund_timestamps,
+
+    -- paid ABOVE list, probably FX on non-USD orders. Worst refund tier at 25%.
+    COUNT(order_line_id) FILTER (WHERE price_above_list) AS price_above_list_rows,
+
+    -- 'direct' is not a channel, it is missing attribution. Any channel-ROI
+    -- claim is limited to the ~20% of orders that are actually attributed.
+    COUNT(order_line_id) FILTER (WHERE marketing_channel = 'unattributed_direct')::numeric
+        / COUNT(order_line_id)::numeric AS unattributed_traffic_pct
 FROM fact_order_lines;
