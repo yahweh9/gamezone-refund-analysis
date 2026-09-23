@@ -63,6 +63,7 @@ SELECT
     "COUNTRY_CODE"            AS country_code,
 
     "PURCHASE_TS"             AS purchase_ts,
+    "PURCHASE_TS"::date AS purchase_date, 
     "SHIP_TS"                 AS ship_ts,
     -- date - date returns a plain integer of days. EXTRACT(DAY FROM interval)
     -- would return only the days component and drop any months.
@@ -77,6 +78,15 @@ SELECT
     "USD_PRICE"               AS usd_price,
     "DISCOUNT_PCT"            AS discount_pct,    -- negative = paid above list
     "PRICE_ABOVE_LIST"        AS price_above_list,
+
+    -- NEW: Row-level discount tier for Power BI
+    CASE 
+        WHEN "PRICE_ABOVE_LIST" THEN '0. Above list price'
+        WHEN "DISCOUNT_PCT" <= 0 THEN '1. At list price'
+        WHEN "DISCOUNT_PCT" <= 0.10 THEN '2. 1% to 10% discount'
+        WHEN "DISCOUNT_PCT" <= 0.20 THEN '3. 11% to 20% discount'
+        ELSE '4. Over 20% discount'
+    END AS discount_tier,
 
     "PURCHASE_PLATFORM"       AS purchase_platform,
     "MARKETING_CHANNEL"       AS marketing_channel,
@@ -95,6 +105,7 @@ ALTER TABLE fact_order_lines
     ALTER COLUMN country_code     SET NOT NULL,
     ALTER COLUMN product_id       SET NOT NULL,
     ALTER COLUMN purchase_ts      SET NOT NULL,
+    ALTER COLUMN purchase_date    SET NOT NULL, 
     ALTER COLUMN usd_price        SET NOT NULL,
     ALTER COLUMN is_refunded      SET NOT NULL,
     ALTER COLUMN in_valid_window  SET NOT NULL;
@@ -150,3 +161,4 @@ SELECT
     (SELECT COUNT(*) FROM fact_order_lines WHERE in_valid_window)    AS in_window_count,   -- expect 21782
     (SELECT COUNT(*) FROM fact_order_lines WHERE price_above_list)   AS above_list_count,  -- expect 2040
     (SELECT COUNT(*) FROM fact_order_lines WHERE dates_were_swapped) AS swapped_count;     -- expect 2000
+
